@@ -16,26 +16,48 @@ const socket = zmq.socket('pair');
 const simulate = true; // Sends synthetic data
 const debug = false; // Pretty print any bytes in and out... it's amazing...
 const verbose = true; // Adds verbosity to functions
+const protocol = 'tcp'; // or 'udp'
 
-const Cyton = require('../..');
+
+/*const Cyton = require('../..');
 let ourBoard = new Cyton({
   simulate: simulate, // Uncomment to see how it works with simulator!
   simulatorFirmwareVersion: 'v2',
   debug: debug,
   verbose: verbose
 });
+*/
+
+const k = require('openbci-utilities').Constants;
+let Wifi = require('../../openBCIWifi');
+let ourBoard = new Wifi({
+                    simulate: simulate, // Uncomment to see how it works with simulator!
+                    simulatorFirmwareVersion: 'v2',
+                    simulatorSampleRate: 1000,
+                    simulatorDaisyModuleAttached: true,
+                    debug: debug,
+                    verbose: verbose,
+                    sendCounts: false,
+                    latency: 16667,
+                    protocol: protocol
+                    });
 
 let timeSyncPossible = false;
 let resyncPeriodMin = 1;
 let secondsInMinute = 60;
 let resyncPeriod = ourBoard.sampleRate() * resyncPeriodMin * secondsInMinute;
+let counter = 0;
+let sampleRateCounterInterval = null;
+let lastSampleNumber = 0;
+let MAX_SAMPLE_NUMBER = 255;
+let droppedPacketArray = [];
+let sampleRateArray = [];
+let droppedPackets = 0;
 
-ourBoard.autoFindOpenBCIBoard().then(portName => {
+
+/*
+ ourBoard.autoFindOpenBCIBoard().then(portName => {
   if (portName) {
-    /**
-     * Connect to the board with portName
-     * i.e. ourBoard.connect(portName).....
-     */
     // Call to connect
     ourBoard.connect(portName)
       .then(() => {
@@ -58,27 +80,30 @@ ourBoard.autoFindOpenBCIBoard().then(portName => {
         console.log(`connect: ${err}`);
       });
   } else {
-    /** Unable to auto find OpenBCI board */
+    // Unable to auto find OpenBCI board
     console.log('Unable to auto find OpenBCI board');
   }
 });
+ */
+ourBoard.searchToStream({
+                            streamStart: true,
+                            sampleRate: 1000
+                            })
+.then(() => {
+      if (wifi.getNumberOfChannels() === 4) {
+      MAX_SAMPLE_NUMBER = 200;
+      } else {
+      MAX_SAMPLE_NUMBER = 255;
+      }
+      })
+.catch((err) => {
+       console.log(err);
+       process.exit(0);
+       });
+
 
 const sampleFunc = sample => {
   console.log(JSON.stringify(sample));
-
-  if (sample._count % resyncPeriod === 0) {
-    ourBoard.syncClocksFull()
-      .then(syncObj => {
-        // Sync was successful
-        if (syncObj.valid) {
-          // Log the object to check it out!
-          console.log(`timeOffset`, syncObj.timeOffsetMaster);
-        } else {
-          // Retry it
-          console.log(`Was not able to sync... retry!`);
-        }
-      });
-  }
 
   if (sample.timestamp) { // true after the first successful sync
     if (sample.timestamp < 10 * 60 * 60 * 1000) { // Less than 10 hours
@@ -91,10 +116,60 @@ const sampleFunc = sample => {
       });
     }
   }
+  
+  try {
+    console.log(JSON.stringify(sample));
+    if (sample.valid) {
+      counter++;
+      if (sampleRateCounterInterval === null) {
+        sampleRateCounterInterval = setInterval(() => {
+                                                console.log(`\nSR: ${counter}`);
+                                                console.log(`Dropped ${droppedPackets} packets`);
+                                                droppedPacketArray.push(droppedPackets);
+                                                let sum = 0;
+                                                droppedPacketArray.map((droppedPacketCnt) => {
+                                                                       sum += droppedPacketCnt;
+                                                                       });
+                                                console.log(`Dropped packet average: ${sum / droppedPacketArray.length}`);
+                                                
+                                                sampleRateArray.push(counter);
+                                                sum = 0;
+                                                sampleRateArray.map((counter) => {
+                                                                    sum += counter;
+                                                                    });
+                                                droppedPackets = 0;
+                                                counter = 0;
+                                                
+                                                }, 1000);
+      }
+      
+      let packetDiff = sample.sampleNumber - lastSampleNumber;
+      if (packetDiff < 0) packetDiff += MAX_SAMPLE_NUMBER;
+      if (packetDiff > 1) {
+        console.log(`dropped ${packetDiff} packets | cur sn: ${sample.sampleNumber} | last sn: ${lastSampleNumber}`);
+        droppedPackets += packetDiff;
+      }
+      lastSampleNumber = sample.sampleNumber;
+      
+      // console.log(JSON.stringify(sample));
+      sendToPython({
+                   action: 'process',
+                   command: 'sample',
+                   message: sample
+                   });
+    }
+  } catch (err) {
+    console.log(err);
+  }
 };
 
 // Subscribe to your functions
-ourBoard.on('sample', sampleFunc);
+wifi.on(k.OBCIEmitterImpedance, (impedance) => {
+        console.log(JSON.stringify(impedance));
+        });
+wifi.on(k.OBCIEmitterSample, sampleFunc);
+// wifi.on(k.OBCIEmitterRawDataPacket, console.log);
+
 
 // ZMQ fun
 
@@ -173,24 +248,42 @@ function unrecognizedCommand (body) {
   console.log(`unrecognizedCommand ${body}`);
 }
 
+
 function exitHandler (options, err) {
   if (options.cleanup) {
     if (verbose) console.log('clean');
     /** Do additional clean up here */
+    if (ourBoard.isConnected()) ourBoard.disconnect().catch(console.log);
+    ourBoard.removeAllListeners('rawDataPacket');
+    ourBoard.removeAllListeners('sample');
+    ourBoard.destroy();
+    if (sampleRateCounterInterval) {
+      clearInterval(sampleRateCounterInterval);
+    }
   }
   if (err) console.log(err.stack);
   if (options.exit) {
     if (verbose) console.log('exit');
-    ourBoard.disconnect()
+    if (ourBoard.isStreaming()) {
+      let timmy = setTimeout(() => {
+                             console.log("timeout");
+                             process.exit(0);
+                             }, 1000);
+      ourBoard.streamStop()
       .then(() => {
-        process.exit(0);
-      })
-      .catch((err) => {
-        console.log(err);
-        process.exit(0);
-      });
+            console.log('stream stopped');
+            if (timmy) clearTimeout(timmy);
+            process.exit(0);
+            }).catch((err) => {
+                     console.log(err);
+                     process.exit(0);
+                     });
+    } else {
+      process.exit(0);
+    }
   }
 }
+
 
 if (process.platform === 'win32') {
   const rl = require('readline').createInterface({
